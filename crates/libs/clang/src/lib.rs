@@ -3666,7 +3666,7 @@ fn write_named_record(
         result.push_str(&format!("    #[align({alignment})]\n"));
     }
     result.push_str(&format!("    {keyword} {name} {{\n"));
-    result.push_str(&write_record_fields(fields, projection, 8)?);
+    result.push_str(&write_record_fields(fields, packing, union, projection, 8)?);
     result.push_str("    }\n");
     result.push_str(&write_nested_records(fields, projection)?);
     Ok(result)
@@ -3706,8 +3706,20 @@ fn write_nested_type(ty: &TypeRef, projection: &TypeProjection<'_>) -> Result<St
     }
 }
 
+fn next_pad_name(existing: &BTreeSet<String>, pad_count: &mut usize) -> String {
+    loop {
+        let name = format!("_pad{}", *pad_count);
+        *pad_count += 1;
+        if !existing.contains(&name) {
+            return name;
+        }
+    }
+}
+
 fn write_record_fields(
     fields: &[Field],
+    packing: Option<i64>,
+    union: bool,
     projection: &TypeProjection<'_>,
     indent: usize,
 ) -> Result<String, Error> {
@@ -3716,6 +3728,9 @@ fn write_record_fields(
     let bitfield_groups = bitfield_groups(fields)?;
     let mut group_index = 0;
     let mut index = 0;
+    let mut byte_cursor = 0;
+    let mut pad_count = 0;
+    let existing_names: BTreeSet<String> = fields.iter().map(|f| f.name.clone()).collect();
     while index < fields.len() {
         let field = &fields[index];
         if field.bit_width == Some(0) {
@@ -3723,6 +3738,17 @@ fn write_record_fields(
             continue;
         }
         if let TypeRef::InlineRecord(record) = &field.ty {
+            if !union && field.offset >= 0 {
+                let actual_offset = field.offset / 8;
+                let field_align = packing.map_or(field.align, |p| p.min(field.align));
+                let natural_offset = align_up(byte_cursor, field_align);
+                if actual_offset > natural_offset {
+                    let gap = actual_offset - byte_cursor;
+                    let pad_name = next_pad_name(&existing_names, &mut pad_count);
+                    result.push_str(&format!("{spaces}{pad_name}: [u8; {gap}],\n"));
+                    byte_cursor += gap;
+                }
+            }
             let keyword = if record.union { "union" } else { "struct" };
             result.push_str(&format!("{spaces}{}: ", rdl_ident(&field.name)));
             if let Some(packing) = record.packing {
@@ -3734,24 +3760,54 @@ fn write_record_fields(
             result.push_str(&format!("{keyword} {{\n"));
             result.push_str(&write_record_fields(
                 &record.fields,
+                record.packing,
+                record.union,
                 projection,
                 indent + 4,
             )?);
             result.push_str(&format!("{spaces}}},\n"));
+            if !union && field.offset >= 0 {
+                byte_cursor = (field.offset / 8) + field.size;
+            }
             index += 1;
             continue;
         }
         if field.bit_width.is_none() {
+            if !union && field.offset >= 0 {
+                let actual_offset = field.offset / 8;
+                let field_align = packing.map_or(field.align, |p| p.min(field.align));
+                let natural_offset = align_up(byte_cursor, field_align);
+                if actual_offset > natural_offset {
+                    let gap = actual_offset - byte_cursor;
+                    let pad_name = next_pad_name(&existing_names, &mut pad_count);
+                    result.push_str(&format!("{spaces}{pad_name}: [u8; {gap}],\n"));
+                    byte_cursor += gap;
+                }
+            }
             result.push_str(&format!(
                 "{spaces}{}: {},\n",
                 rdl_ident(&field.name),
                 projection.name(&field.ty)
             ));
+            if !union && field.offset >= 0 {
+                byte_cursor = (field.offset / 8) + field.size;
+            }
             index += 1;
             continue;
         }
         let group = &bitfield_groups[group_index];
         group_index += 1;
+        if !union && group.offset >= 0 {
+            let actual_offset = group.offset / 8;
+            let field_align = packing.map_or(field.align, |p| p.min(field.align));
+            let natural_offset = align_up(byte_cursor, field_align);
+            if actual_offset > natural_offset {
+                let gap = actual_offset - byte_cursor;
+                let pad_name = next_pad_name(&existing_names, &mut pad_count);
+                result.push_str(&format!("{spaces}{pad_name}: [u8; {gap}],\n"));
+                byte_cursor += gap;
+            }
+        }
         let backing = if bitfield_groups.len() == 1 {
             "_bitfield".to_string()
         } else {
@@ -3761,13 +3817,13 @@ fn write_record_fields(
             "{spaces}{backing}: {} {{\n",
             projection.name(&field.ty)
         ));
-        let mut cursor = group.offset;
+        let mut bit_cursor = group.offset;
         for member in &fields[group.start..group.end] {
-            if member.offset > cursor {
+            if member.offset > bit_cursor {
                 result.push_str(&format!(
                     "{}_: {},\n",
                     " ".repeat(indent + 4),
-                    member.offset - cursor
+                    member.offset - bit_cursor
                 ));
             }
             let width = member.bit_width.unwrap();
@@ -3777,9 +3833,12 @@ fn write_record_fields(
                 rdl_ident(&member.name)
             };
             result.push_str(&format!("{}{name}: {width},\n", " ".repeat(indent + 4)));
-            cursor = member.offset + i64::from(width);
+            bit_cursor = member.offset + i64::from(width);
         }
         result.push_str(&format!("{spaces}}},\n"));
+        if !union && group.offset >= 0 {
+            byte_cursor = (group.offset / 8) + field.size;
+        }
         index = group.end;
     }
     Ok(result)

@@ -495,7 +495,66 @@ fn explicitly_aligned_fields_preserve_record_layout() {
 
     assert!(rdl.contains("#[align(8)]\n    struct ALIGNED_FIELDS"));
     assert!(rdl.contains("count: u32"));
+    assert!(rdl.contains("_pad0: [u8; 4]"), "{rdl}");
     assert!(rdl.contains("mode: u8"));
+    assert!(rdl.contains("_pad1: [u8; 7]"), "{rdl}");
+}
+
+#[test]
+fn io_stack_location_pointer_alignment_preserves_field_offsets() {
+    helpers::ensure_libclang();
+
+    let rdl = extract(
+        [Input::new(
+            "io_stack_location.hpp",
+            "#define POINTER_ALIGNMENT __declspec(align(8))\n\
+             typedef struct _IO_STACK_LOCATION {\n\
+                 unsigned char MajorFunction;\n\
+                 unsigned char MinorFunction;\n\
+                 unsigned char Flags;\n\
+                 unsigned char Control;\n\
+                 union {\n\
+                     struct {\n\
+                         unsigned long OutputBufferLength;\n\
+                         unsigned long POINTER_ALIGNMENT InputBufferLength;\n\
+                         unsigned long POINTER_ALIGNMENT IoControlCode;\n\
+                         void* Type3InputBuffer;\n\
+                     } DeviceIoControl;\n\
+                 } Parameters;\n\
+             } IO_STACK_LOCATION;\n",
+        )],
+        &[
+            "-x",
+            "c++",
+            "-fms-extensions",
+            "--target=x86_64-pc-windows-msvc",
+        ],
+    )
+    .unwrap()
+    .emit("Records")
+    .unwrap();
+
+    assert!(rdl.contains("struct IO_STACK_LOCATION"), "{rdl}");
+    assert!(rdl.contains("OutputBufferLength: u32"), "{rdl}");
+    assert!(rdl.contains("_pad0: [u8; 4]"), "{rdl}");
+    assert!(rdl.contains("InputBufferLength: u32"), "{rdl}");
+    assert!(rdl.contains("_pad1: [u8; 4]"), "{rdl}");
+    assert!(rdl.contains("IoControlCode: u32"), "{rdl}");
+    assert!(rdl.contains("Type3InputBuffer: *mut void"), "{rdl}");
+
+    let scratch = std::env::temp_dir().join(format!("io-stack-location-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let rdl_path = scratch.join("io_stack.rdl");
+    let winmd_path = scratch.join("io_stack.winmd");
+    std::fs::write(&rdl_path, &rdl).unwrap();
+
+    windows_rdl::reader()
+        .input(&rdl_path)
+        .output(&winmd_path)
+        .write()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(scratch);
 }
 
 #[test]
